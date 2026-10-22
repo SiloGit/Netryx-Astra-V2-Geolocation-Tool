@@ -62,6 +62,10 @@ CROP_QUEUE_SIZE =  1024
 # Create mode downloads and projects panoramas in chunks of this many, so the
 # downloads overlap with encoding and only one chunk of tiles sits in RAM.
 DOWNLOAD_CHUNK_PANOS = 256
+# Threads stitching and projecting panoramas in Create mode. Projection runs on
+# the GPU; on Apple GPUs (memory shared with the system) 128 threads each holding
+# a full panorama took an 800-panorama run to 1.3 GB free, 8 keep 3.4 GB free.
+PROJECTION_WORKERS = 8 if torch.backends.mps.is_available() else MAX_PANOID_WORKERS
 
 # Each panoid API call already searches a radius around the query point
 # (PANOID_SEARCH_RADIUS_M, sent in _panoids_request_body) and returns every pano
@@ -2373,7 +2377,7 @@ class StreetViewMatcherGUI:
         # entire download and held every tile of the area in RAM at once.
         tracker.update(skipped)
         done_count, incomplete = skipped, 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PANOID_WORKERS) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PROJECTION_WORKERS) as executor:
             for start in range(0, len(panoids_needing_download), DOWNLOAD_CHUNK_PANOS):
                 chunk = panoids_needing_download[start:start + DOWNLOAD_CHUNK_PANOS]
                 def _dl_progress(done, total, start=start):
