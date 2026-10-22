@@ -54,12 +54,10 @@ MEGALOC_BATCH_SIZE = 64  # descriptors are identical at any batch size; larger =
 CROP_QUEUE_SIZE =  1024
 
 # Each panoid API call already searches a radius around the query point
-# (the "2d50" param in _panoids_url — 50 meters) and returns every pano
+# (PANOID_SEARCH_RADIUS_M, sent in _panoids_request_body) and returns every pano
 # Google finds inside it, not just the one nearest the exact coordinate.
 # Grid points closer together than this radius search overlapping circles
 # and mostly rediscover the same panos, which is pure wasted API calls.
-# PANOID_SEARCH_RADIUS_M must match the "2d{N}" value in _panoids_url below
-# -- if you change one, change the other.
 PANOID_SEARCH_RADIUS_M = 50
 # Grid spacing = radius * this factor. <1.0 leaves deliberate overlap so
 # thin strips of coverage (e.g. a road running between two grid points)
@@ -413,9 +411,19 @@ def draw_matches(img1, img2, kp1, kp2, matches=None, color=(0, 255, 0)):
 IMGX = 4
 IMGY = 2
 
-def _panoids_url(lat, lon):
-    url = "https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch?pb=!1m5!1sapiv3!5sUS!11m2!1m1!1b0!2m4!1m2!3d{0:}!4d{1:}!2d50!3m10!2m2!1sen!2sGB!9m1!1e2!11m4!1m3!1e2!2b1!3e2!4m10!1e1!1e2!1e3!1e4!1e8!1e6!5m1!1e2!6m1!1e2&callback=_xdc_._v2mub5"
-    return url.format(lat, lon)
+# The old GET endpoint (maps/api/js/GeoPhotoService.SingleImageSearch) is
+# decommissioned. This is the JSON+protobuf RPC the Maps JS API uses now; the
+# response nests panoids and coordinates the same way, so panoids_from_response
+# parses it unchanged.
+PANOIDS_SEARCH_URL = "https://maps.googleapis.com/$rpc/google.internal.maps.mapsjs.v1.MapsJsInternalService/SingleImageSearch"
+
+def _panoids_request_body(lat, lon, radius_m=PANOID_SEARCH_RADIUS_M):
+    return json.dumps([
+        ["apiv3", None, None, None, "US"],
+        [[None, None, lat, lon], float(radius_m)],
+        [None, ["en", "GB"], None, None, None, None, None, None, [2], None, [[[2, True, 2]]]],
+        [[1, 2, 3, 4, 6, 8, 12], None, None, None, [], []],
+    ])
 
 def panoids_from_response(text):
     matches = re.findall(r'"([A-Za-z0-9_-]{22})"', text)
@@ -620,12 +628,13 @@ def get_panoids(points, status_callback=None, max_workers=64):
         # 3 attempts + a short timeout: repeated failures are almost always
         # genuinely empty spots (water/no coverage), so extra retries and a long
         # timeout just add a slow tail with no extra panos found.
-        url = _panoids_url(lat, lon)
+        body = _panoids_request_body(lat, lon)
         attempt = 0
         rate_limit_retries = 0  # 429s get their own budget so real points aren't dropped
         while attempt < max_attempts:
             try:
-                async with session.get(url, timeout=15) as resp:
+                async with session.post(PANOIDS_SEARCH_URL, data=body, timeout=15,
+                                        headers={"Content-Type": "application/json+protobuf"}) as resp:
                     status = resp.status
                     text = await resp.text()
                     if status == 429:
