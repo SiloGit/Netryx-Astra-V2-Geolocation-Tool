@@ -29,6 +29,10 @@ except ImportError:
 import asyncio
 import aiohttp
 import tkintermapview
+# tkintermapview 1.30 resizes overlay tiles with Image.ANTIALIAS, which Pillow 10
+# removed; without this every map tile silently renders blank.
+if not hasattr(Image, "ANTIALIAS"):
+    Image.ANTIALIAS = Image.LANCZOS
 import webbrowser
 from megaloc_utils import (
     get_megaloc_model, extract_megaloc_descriptor,
@@ -578,6 +582,67 @@ def haversine_vec(center_lat, center_lon, lats, lons):
     a = np.sin(dlat / 2) ** 2 + math.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
     return R * c
+
+def coverage_polylines(latlons, max_link_km=0.03, bucket_deg=0.0002):
+    """Turn panorama locations into polylines that trace the streets.
+
+    Links each point only to nearby points (<= max_link_km), keeps the minimum
+    spanning forest of those links, and splits it into chains at junctions and
+    dead ends. Drawing every chain gives the street network; a single polyline
+    through a whole component in visit order zigzags across it instead.
+
+    Returns (chains, singles): chains is a list of [(lat, lon), ...] with at
+    least two points each; singles are points with no neighbour in range.
+    """
+    grid = defaultdict(list)
+    for loc in latlons:
+        grid[(int(loc[0] / bucket_deg), int(loc[1] / bucket_deg))].append(loc)
+
+    edges = []
+    for (bx, by), bucket_locs in grid.items():
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for a in bucket_locs:
+                    for b in grid.get((bx + dx, by + dy), ()):
+                        if a < b:
+                            d = haversine(a, b)
+                            if d <= max_link_km:
+                                edges.append((d, a, b))
+    edges.sort()
+
+    parent = {loc: loc for loc in latlons}
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    adj = defaultdict(list)
+    for _, a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+            adj[a].append(b)
+            adj[b].append(a)
+
+    chains, used = [], set()
+    for start in adj:
+        if len(adj[start]) == 2:
+            continue  # chains start and end at dead ends or junctions
+        for nxt in adj[start]:
+            if (start, nxt) in used:
+                continue
+            chain, prev, cur = [start], start, nxt
+            used.add((start, nxt)); used.add((nxt, start))
+            while True:
+                chain.append(cur)
+                if len(adj[cur]) != 2:
+                    break
+                prev, cur = cur, adj[cur][0] if adj[cur][0] != prev else adj[cur][1]
+                used.add((prev, cur)); used.add((cur, prev))
+            chains.append(chain)
+    singles = [loc for loc in latlons if loc not in adj]
+    return chains, singles
 
 def grid_points(center, radius, spacing_m):
     """Build a grid of coordinates to probe for Street View panoramas.
@@ -1678,12 +1743,20 @@ class StreetViewMatcherGUI:
         self.map_frame.grid(row=0, column=1, sticky='nsew', padx=(20, 0))
         self.map_widget = tkintermapview.TkinterMapView(self.map_frame, corner_radius=15)
         self.map_widget.pack(fill="both", expand=True)
-        self.map_widget.set_tile_server("https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png", max_zoom=19)
+        # CARTO basemaps now need an API key (every tile is an "API KEY REQUIRED"
+        # image) and OSM blocks tkintermapview's user agent. Esri's satellite
+        # imagery and label overlay are keyless and go to zoom 19.
+        self.map_widget.set_tile_server(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", max_zoom=19)
+        self.map_widget.set_overlay_tile_server(
+            "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}")
         self.map_widget.set_position(self.lat_var.get(), self.lon_var.get())
         self.map_widget.set_zoom(15)
 
         self.monitor_label = ttk.Label(self.map_frame, text="TARGET SCAN", foreground="#00ff9d", background="black")
         self.monitor_label.place(relx=0.98, rely=0.02, anchor="ne")
+        ttk.Label(self.map_frame, text="Imagery © Esri, Maxar, Earthstar Geographics", foreground="#9ca3af",
+                  background="black", font=('Avenir Next', 8)).place(relx=0.98, rely=0.98, anchor="se")
 
         # State
         self.coverage_markers, self.result_elements, self.search_nets = [], [], []
@@ -2726,47 +2799,15 @@ class StreetViewMatcherGUI:
             self.map_widget.set_zoom(13)
 
             MAX_CONNECT_DIST_KM = 0.03
-            BUCKET_SIZE = 0.0002
-            grid = defaultdict(list)
-            for loc in latlons:
-                bucket_key = (int(loc[0] / BUCKET_SIZE), int(loc[1] / BUCKET_SIZE))
-                grid[bucket_key].append(loc)
-
-            graph = defaultdict(list)
-            for bucket_key, bucket_locs in grid.items():
-                for dlat in [-1, 0, 1]:
-                    for dlon in [-1, 0, 1]:
-                        neighbor_key = (bucket_key[0] + dlat, bucket_key[1] + dlon)
-                        if neighbor_key not in grid: continue
-                        for loc1 in bucket_locs:
-                            for loc2 in grid[neighbor_key]:
-                                if loc1 >= loc2: continue
-                                if haversine(loc1, loc2) <= MAX_CONNECT_DIST_KM:
-                                    graph[loc1].append(loc2)
-                                    graph[loc2].append(loc1)
-
-            visited = set()
-            line_count = 0
-            for start_loc in latlons:
-                if start_loc in visited: continue
-                component = []
-                bfs_queue = [start_loc]
-                visited.add(start_loc)
-                while bfs_queue:
-                    current = bfs_queue.pop(0)
-                    component.append(current)
-                    for neighbor in graph[current]:
-                        if neighbor not in visited:
-                            visited.add(neighbor)
-                            bfs_queue.append(neighbor)
-                if len(component) >= 2:
-                    path = self.map_widget.set_path(component, color="#3b82f6", width=3)
-                    self.coverage_markers.append(path)
-                    line_count += 1
-                elif len(component) == 1:
-                    marker = self.map_widget.set_marker(component[0][0], component[0][1], text="",
-                        marker_color_circle="#3b82f6", marker_color_outside="#1e3a8a")
-                    self.coverage_markers.append(marker)
+            chains, singles = coverage_polylines(latlons, MAX_CONNECT_DIST_KM)
+            line_count = len(chains)
+            for chain in chains:
+                path = self.map_widget.set_path(chain, color="#3b82f6", width=3)
+                self.coverage_markers.append(path)
+            for lat, lon in singles:
+                marker = self.map_widget.set_marker(lat, lon, text="",
+                    marker_color_circle="#3b82f6", marker_color_outside="#1e3a8a")
+                self.coverage_markers.append(marker)
 
             status_msg = f"Coverage: {len(locations)} points, {line_count} segments."
         else:
