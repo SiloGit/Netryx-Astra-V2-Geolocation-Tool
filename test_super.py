@@ -54,8 +54,14 @@ MAX_HEADING_WORKERS = 4
 MAX_DOWNLOAD_WORKERS = 120
 MAX_MATCH_WORKERS = 16
 EARLY_EXIT_INLIER_THRESHOLD = 300
-MEGALOC_BATCH_SIZE = 64  # descriptors are identical at any batch size; larger = better GPU utilization
+# descriptors are identical at any batch size. On Apple GPUs (memory shared
+# with the system) 16 is as fast as 64 and 64 pushed a 16 GB Mac into swap;
+# dedicated CUDA/ROCm GPUs keep 64.
+MEGALOC_BATCH_SIZE = 16 if torch.backends.mps.is_available() else 64
 CROP_QUEUE_SIZE =  1024
+# Create mode downloads and projects panoramas in chunks of this many, so the
+# downloads overlap with encoding and only one chunk of tiles sits in RAM.
+DOWNLOAD_CHUNK_PANOS = 256
 
 # Each panoid API call already searches a radius around the query point
 # (PANOID_SEARCH_RADIUS_M, sent in _panoids_request_body) and returns every pano
@@ -509,10 +515,19 @@ async def _download_tiles_multi(panoid_tile_lists, max_workers=120, status_callb
     total_tiles = sum(len(t) for t in panoid_tile_lists.values())
     done = 0
 
+    # The per-request timeout starts when session.get() is called, even if the
+    # request is still waiting for a free pooled connection. With every tile
+    # queued at once, tiles more than ~10 s back in the queue timed out without
+    # ever being sent, and their panoramas were silently dropped (18% of 1,500
+    # panoramas against a local server, 87% of 5,140 against Google). The
+    # semaphore keeps queued tiles from starting their timeout early.
+    in_flight = asyncio.Semaphore(max_workers)
+
     async with aiohttp.ClientSession(connector=connector, headers=_headers) as session:
         async def fetch_one(pid, x, y, fname, url):
             nonlocal done
-            xr, yr, data = await download_tile_aiohttp(session, x, y, fname, url)
+            async with in_flight:
+                xr, yr, data = await download_tile_aiohttp(session, x, y, fname, url)
             if data:
                 results[pid][(xr, yr)] = data
             done += 1
@@ -2319,31 +2334,13 @@ class StreetViewMatcherGUI:
 
         skipped = len(panoids) - len(panoids_needing_download)
 
-        # Download tiles for ALL panoids that need them in ONE shared event
-        # loop / connection pool, instead of one asyncio.run() per panoid.
-        # Spinning up a fresh event loop per panoid inside an already-
-        # concurrent ThreadPoolExecutor (up to MAX_PANOID_WORKERS at once,
-        # each opening its own MAX_DOWNLOAD_WORKERS-sized pool for just 8
-        # tiles) was the actual bottleneck in this stage.
-        all_tiles_data = {}
-        if panoids_needing_download:
-            def _dl_progress(done, total):
-                q.put(('status', f"Downloading tiles: {done}/{total}..."))
-
-            all_tiles_data = download_tiles_for_panoids(
-                [p['panoid'] for p in panoids_needing_download],
-                max_workers=MAX_DOWNLOAD_WORKERS,
-                status_callback=_dl_progress,
-            )
-
-        def process_one_panoid(panoid):
+        def process_one_panoid(panoid, tiles_data):
             panoid_id = panoid['panoid']
             missing_yaws = missing_yaws_by_id.get(panoid_id)
             if not missing_yaws:
                 return True
-
-            tiles_data = all_tiles_data.get(panoid_id)
-            if not tiles_data:
+            # A panorama with missing tiles would be indexed with black holes.
+            if not tiles_data or len(tiles_data) < IMGX * IMGY:
                 return False
             try:
                 pano_img = stitch_tiles(tiles_data)
@@ -2369,14 +2366,34 @@ class StreetViewMatcherGUI:
             del pano_t
             return True
 
-        # Stitching + equirectangular projection is CPU-bound (numpy/torch,
-        # no network waiting), so a thread pool is the right tool here --
-        # the network I/O already happened above in the shared async batch.
+        # Download and project in chunks: each chunk's tiles are fetched in one
+        # shared event loop / connection pool, then stitched and projected
+        # while the extractor thread keeps encoding the crops already queued.
+        # Downloading the whole area first left the encoder idle for the
+        # entire download and held every tile of the area in RAM at once.
         tracker.update(skipped)
+        done_count, incomplete = skipped, 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_PANOID_WORKERS) as executor:
-            for idx, _ in enumerate(executor.map(process_one_panoid, panoids_needing_download), skipped + 1):
-                tracker.update(idx)
-                q.put(('status', f"Stitching & projecting: {tracker.get_status()}"))
+            for start in range(0, len(panoids_needing_download), DOWNLOAD_CHUNK_PANOS):
+                chunk = panoids_needing_download[start:start + DOWNLOAD_CHUNK_PANOS]
+                def _dl_progress(done, total, start=start):
+                    q.put(('status', f"Downloading tiles: panoramas {start + 1}-{start + len(chunk)} "
+                                     f"of {len(panoids_needing_download)} ({done}/{total} tiles)..."))
+                chunk_tiles = download_tiles_for_panoids(
+                    [p['panoid'] for p in chunk],
+                    max_workers=MAX_DOWNLOAD_WORKERS,
+                    status_callback=_dl_progress,
+                )
+                results = executor.map(lambda p: process_one_panoid(p, chunk_tiles.get(p['panoid'])), chunk)
+                for ok in results:
+                    done_count += 1
+                    incomplete += not ok
+                    tracker.update(done_count)
+                    q.put(('status', f"Stitching & projecting: {tracker.get_status()}"))
+                del chunk_tiles
+        if incomplete:
+            q.put(('status', f"Skipped {incomplete} panoramas with missing tiles."))
+            print(f"[INDEX] Skipped {incomplete} panoramas with missing tiles")
 
         crop_queue.put("DONE")
         extractor_thread.join()
