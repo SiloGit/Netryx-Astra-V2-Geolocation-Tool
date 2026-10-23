@@ -207,24 +207,27 @@ python netryx_hub.py import moscow_1km.netryx -o ./netryx_data/index
 **Mac / Linux:**
 ```bash
 git clone https://github.com/sparkyniner/Netryx-Astra-V2-Geolocation-Tool.git
-cd netryx-astra-v2
-chmod +x setup.sh && ./setup.sh
-source venv/bin/activate
-python3 test_super.py
+cd Netryx-Astra-V2-Geolocation-Tool
+./setup.sh
 ```
+Then start Netryx with **`./run.sh`**, or on a Mac just double-click **`Netryx.command`** in the folder.
 
-**Windows:**
+**Windows:** install [Python 3.12](https://www.python.org/downloads/windows/) and [Git](https://git-scm.com) first, then:
 ```
 git clone https://github.com/sparkyniner/Netryx-Astra-V2-Geolocation-Tool.git
 cd Netryx-Astra-V2-Geolocation-Tool
 ```
-Then double-click **`setup.bat`** to install everything. When it finishes, double-click **`run.bat`** to launch.
+Double-click **`setup.bat`** to install everything. When it finishes, double-click **`run.bat`** to start Netryx.
 
-That's it. The setup script creates a virtual environment, installs all dependencies, clones MASt3R alongside the repo, and pre-downloads the model weights. No manual configuration needed.
+That's it. Setup finds a suitable Python on your computer (3.10–3.12, even if your default is newer), creates a virtual environment, installs the dependencies, downloads MASt3R next to the repo and pre-downloads the model weights. It's safe to run again: finished steps are skipped. If anything is missing, it tells you exactly what to install.
+
+### Your first search in 5 minutes
+
+When Netryx opens, press **Try the demo** at the top of the sidebar. It downloads a small sample index of central Moscow (about 180 MB, once) and loads a sample photo taken there. Press **Run Search** and watch it find the spot. The guided tour (**Help & tour**) explains every part of the window.
 
 ### What you need
 
-- **Python 3.10+**
+- **Python 3.10, 3.11 or 3.12** with Tk (the python.org installers include it)
 - **macOS** (Apple Silicon via MPS), 
 - **Linux** (NVIDIA GPU via CUDA, AMD GPU via ROCM), or 
 - **Windows** (NVIDIA GPU via CUDA)
@@ -239,7 +242,7 @@ Your folder structure should look like this:
 
 ```
 some_folder/
-├── netryx-astra-v2/       # This repo
+├── Netryx-Astra-V2-Geolocation-Tool/   # This repo
 │   ├── test_super.py
 │   ├── megaloc_utils.py
 │   ├── mast3r_utils.py
@@ -281,7 +284,7 @@ https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-star
 ## Project Structure
 
 ```
-netryx-astra-v2/
+Netryx-Astra-V2-Geolocation-Tool/
 ├── test_super.py          # Main application — GUI, pipeline, everything
 ├── megaloc_utils.py       # MegaLoc model loading, descriptor extraction, PCA
 ├── megaloc_model.py       # Self-contained MegaLoc architecture (fallback if torch.hub fails)

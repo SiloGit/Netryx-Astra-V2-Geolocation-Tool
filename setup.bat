@@ -1,155 +1,144 @@
 @echo off
+:: ===================================================================
+::  Netryx Astra V2 - Windows setup. Double-click to run.
+::  Safe to run again: finished steps are skipped.
+:: ===================================================================
 echo.
 echo ===================================================
 echo   Netryx Astra V2 - Windows Setup
 echo ===================================================
 echo.
 
-:: Remember where we started
 set "NETRYX_DIR=%~dp0"
+cd /d "%NETRYX_DIR%"
+set "LOG=%NETRYX_DIR%installer.log"
+type nul > "%LOG%"
 
-:: Check Python
-python --version >nul 2>>installer.log
-if errorlevel 1 (
-    echo [ERROR] Python not found.
-    echo         Download Python from https://python.org
-    echo         Make sure to check "Add Python to PATH" during install.
+:: --- Python 3.10-3.12 with Tk (the app's window needs Tk) ---------
+:: Prefer the "py" launcher, which finds any installed version, so a
+:: newer default Python (3.13+) on PATH doesn't block setup.
+set "PYEXE="
+for %%V in (3.12 3.11 3.10) do (
+    if not defined PYEXE (
+        py -%%V -c "import tkinter" >nul 2>&1 && set "PYEXE=py -%%V"
+    )
+)
+if not defined PYEXE (
+    python -c "import sys, tkinter; sys.exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)" >nul 2>&1 && set "PYEXE=python"
+)
+if not defined PYEXE (
+    echo [ERROR] Netryx needs Python 3.10, 3.11 or 3.12.
+    echo         Install Python 3.12 from https://www.python.org/downloads/windows/
+    echo         and keep "tcl/tk and IDLE" ticked during install.
+    echo         Then double-click setup.bat again.
     pause
     exit /b 1
 )
+echo [OK] Using Python via: %PYEXE%
 
-:: Verify Python version is compatible
-python -c "import sys; exit(0 if sys.version_info >= (3,10) and sys.version_info < (3,13) else 1)"
-
+git --version >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] Unsupported Python version detected.
-    python --version
-    echo.
-    echo Astra requires Python 3.10 - 3.12.
-    echo Please install a compatible Python version.
-    pause
-    exit /b 1
-)
-
-echo [OK] Compatible Python installation found.
-
-:: Check Git
-git --version >nul 2>>installer.log
-if errorlevel 1 (
-    echo [ERROR] Git not found. Download from https://git-scm.com
+    echo [ERROR] Git not found. Download it from https://git-scm.com and run setup again.
     pause
     exit /b 1
 )
 echo [OK] Git found
 
-:: Check for CUDA Toolkit (requires Visual Studio Build Toools 2018-2022)
-where nvcc >nul 2>>installer.log
-if %errorlevel% neq 0 (
-    echo [WARNING] CUDA Toolkit was not detected.
-    echo [WARNING] Astra can still run using PyTorch CUDA, but MASt3R will use a slower RoPE2D fallback.
-    echo [WARNING] Download CUDA Toolkit 12.4 from https://developer.nvidia.com/cuda-12-4-0-download-archive
-) else (
-    echo [OK] CUDA Toolkit detected
+set "HAS_NVIDIA="
+nvidia-smi >nul 2>&1
+if not errorlevel 1 (
+    set "HAS_NVIDIA=1"
+    echo [OK] NVIDIA GPU detected
+    where nvcc >nul 2>&1
+    if errorlevel 1 echo [INFO] CUDA Toolkit ^(nvcc^) not found: MASt3R will use a slower fallback. Optional.
 )
 
-:: Create venv
-cd /d "%NETRYX_DIR%"
-if not exist "venv" (
+:: --- Virtual environment (rebuilt if made with an unsuitable Python) ---
+if exist "venv\Scripts\python.exe" (
+    venv\Scripts\python.exe -c "import sys, tkinter; sys.exit(0 if (3,10) <= sys.version_info[:2] <= (3,12) else 1)" >nul 2>&1
+    if errorlevel 1 (
+        echo [SETUP] Existing venv uses an unsuitable Python; recreating it...
+        rmdir /s /q venv
+    )
+)
+if not exist "venv\Scripts\python.exe" (
     echo [SETUP] Creating virtual environment...
-    python -m venv venv
+    %PYEXE% -m venv venv
+    if errorlevel 1 (
+        echo [ERROR] Could not create the virtual environment.
+        pause
+        exit /b 1
+    )
 )
-call venv\Scripts\activate.bat
-echo [OK] Virtual environment activated
+set "VPY=%NETRYX_DIR%venv\Scripts\python.exe"
+echo [OK] Virtual environment ready
 
-:: Force python to install a version of Torch compatible with CUDA
-echo Checking for NVIDIA GPU...
-
-nvidia-smi >nul 2>>installer.log
-if %errorlevel%==0 (
-    echo [OK] NVIDIA GPU detected
-    echo Installing CUDA PyTorch...
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124 -q
+:: --- PyTorch ---------------------------------------------------------
+echo [SETUP] Installing PyTorch ^(this can take a few minutes^)...
+"%VPY%" -m pip install --upgrade pip -q
+if defined HAS_NVIDIA (
+    "%VPY%" -m pip install -q torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 ) else (
-    echo [INFO] No NVIDIA GPU detected
-    echo Installing CPU PyTorch...
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 -q
-):: Force python to install a version of Torch compatible with CUDA
-echo Checking for NVIDIA GPU...
-
-nvidia-smi >nul 2>>installer.log
-if %errorlevel%==0 (
-    echo [OK] NVIDIA GPU detected
-    echo Installing CUDA PyTorch...
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124 -q
-) else (
-    echo [INFO] No NVIDIA GPU detected
-    echo Installing CPU PyTorch...
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 -q
+    "%VPY%" -m pip install -q torch==2.6.0 torchvision==0.21.0
+)
+if errorlevel 1 (
+    echo [ERROR] PyTorch failed to install. See the messages above.
+    pause
+    exit /b 1
 )
 
-:: Install dependencies
-echo.
-echo [SETUP] Installing Python dependencies ^(this takes a few minutes^)...
-python -m pip install --upgrade pip -q
-python -m pip install -r requirements.txt -q
-
+echo [SETUP] Installing Python dependencies...
+"%VPY%" -m pip install -q -r requirements.txt
+if errorlevel 1 (
+    echo [ERROR] Dependencies failed to install. See the messages above.
+    pause
+    exit /b 1
+)
 echo [OK] Dependencies installed
 
-:: Clone MASt3R
-echo.
-if exist "%NETRYX_DIR%..\mast3r\mast3r\model.py" (
-    echo [OK] MASt3R already cloned
+:: --- MASt3R (cloned next to this folder) ---------------------------
+set "MAST3R_DIR=%NETRYX_DIR%..\mast3r"
+if exist "%MAST3R_DIR%\mast3r\model.py" (
+    echo [OK] MASt3R already present
 ) else (
-    echo [SETUP] Cloning MASt3R ^(this may take a few minutes^)...
-    cd /d "%NETRYX_DIR%.."
-    git clone --recursive https://github.com/naver/mast3r.git
-    cd /d "%NETRYX_DIR%..\mast3r"
-    python -m pip install -r requirements.txt -q
-    python -m pip install -r dust3r\requirements.txt -q
-    cd /d "%NETRYX_DIR%"
-    echo [OK] MASt3R cloned and dependencies installed
+    echo [SETUP] Downloading MASt3R...
+    git clone --recursive https://github.com/naver/mast3r.git "%MAST3R_DIR%"
+)
+"%VPY%" -m pip install -q -r "%MAST3R_DIR%\requirements.txt"
+"%VPY%" -m pip install -q -r "%MAST3R_DIR%\dust3r\requirements.txt"
+echo [OK] MASt3R ready
+
+:: --- Model weights (optional here: the app downloads them on first use) ---
+echo [SETUP] Downloading MegaLoc model weights ^(first time only^)...
+"%VPY%" -c "import torch; torch.hub.load('gmberton/MegaLoc', 'get_trained_model', trust_repo=True)" >>"%LOG%" 2>&1
+if errorlevel 1 (echo [WARN] MegaLoc download failed; the app will retry on first run) else (echo [OK] MegaLoc ready)
+
+:: The folder is passed through the environment: a path ending in "\"
+:: can't be written inside a Python string literal.
+echo [SETUP] Downloading MASt3R model weights ^(~1.2 GB, first time only^)...
+"%VPY%" -c "import sys,os; p=os.path.abspath(os.environ['MAST3R_DIR']); sys.path[:0]=[p, os.path.join(p,'dust3r'), os.path.join(p,'dust3r','croco')]; from mast3r.model import AsymmetricMASt3R; AsymmetricMASt3R.from_pretrained('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric')" >>"%LOG%" 2>&1
+if errorlevel 1 (echo [WARN] MASt3R weights download failed; the app will retry on first run) else (echo [OK] MASt3R weights ready)
+
+set "HUB_DIR=%USERPROFILE%\.cache\torch\hub\gmberton_VPR-methods-evaluation_master"
+if exist "%HUB_DIR%" (
+    echo [OK] MixVPR code already present
+) else (
+    if not exist "%USERPROFILE%\.cache\torch\hub" mkdir "%USERPROFILE%\.cache\torch\hub"
+    git clone -q https://github.com/gmberton/VPR-methods-evaluation.git "%HUB_DIR%" >>"%LOG%" 2>&1
+    if errorlevel 1 (echo [WARN] MixVPR download failed ^(only needed for the MixVPR encoder^)) else (echo [OK] MixVPR installed)
 )
 
-:: Return to Netryx directory
-cd /d "%NETRYX_DIR%"
+if not exist "netryx_data\megaloc_parts" mkdir "netryx_data\megaloc_parts"
+if not exist "netryx_data\indexes" mkdir "netryx_data\indexes"
 
-:: Pre-download MegaLoc weights
-echo.
-echo [SETUP] Downloading MegaLoc model weights ^(first time only^)...
-python -c "import torch; model = torch.hub.load('gmberton/MegaLoc', 'get_trained_model', trust_repo=True); print('[OK] MegaLoc ready')" 2>>installer.log
-if errorlevel 1 echo [WARN] MegaLoc download failed - will retry on first run
-
-:: Pre-download MASt3R weights
-echo.
-echo [SETUP] Downloading MASt3R model weights ^(~1.2GB, first time only^)...
-python -c "import sys,os; p=os.path.abspath(os.path.join(r'%NETRYX_DIR%','..','mast3r')); sys.path.insert(0,p); sys.path.insert(0,os.path.join(p,'dust3r')); from mast3r.model import AsymmetricMASt3R; m=AsymmetricMASt3R.from_pretrained('naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric'); print('[OK] MASt3R ready')" 2>>installer.log
-if errorlevel 1 echo [WARN] MASt3R download failed - will retry on first run
-
-:: Install MixVPR
-echo [SETUP] Installing MixVPR ^(this may take a few minutes^)...
-cd "%USERPROFILE%\.cache\torch\hub"
-git clone https://github.com/gmberton/VPR-methods-evaluation.git gmberton_VPR-methods-evaluation_master
-echo [OK] MixVPR installed
-
-:: Create data dirs
-cd /d "%NETRYX_DIR%"
-mkdir netryx_data\megaloc_parts 2>>installer.log
-mkdir netryx_data\index 2>>installer.log
-echo [OK] Data directories created
-
-:: Disable Triton for windows beacause it is not supported
-setx TORCH_COMPILE_DISABLE "1"
+:: Triton (torch.compile) is not supported on Windows
+setx TORCH_COMPILE_DISABLE "1" >nul
 set TORCH_COMPILE_DISABLE=1
 
-:: Done
 echo.
 echo ===================================================
 echo   Setup complete!
 echo.
-echo   To run Netryx:
-echo     Double-click run.bat
-echo   Or:
-echo     venv\Scripts\activate
-echo     python test_super.py
+echo   To start Netryx, double-click run.bat
 echo ===================================================
 pause

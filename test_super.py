@@ -1333,6 +1333,11 @@ SUBTLE = '#6b7280'
 
 SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".netryx_settings.json")
 
+# "Try the demo": a small Community Hub index and a photo taken inside it
+DEMO_INDEX_REPO = "netryx-hub/moscow-1km-1km"
+DEMO_CENTER = (55.7569, 37.6151)
+DEMO_PHOTO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "demo", "demo_photo.jpg")
+
 def load_settings():
     try:
         with open(SETTINGS_PATH) as f:
@@ -1674,7 +1679,22 @@ class StreetViewMatcherGUI:
                                       width=120, height=30, font=(UI_FONT, fs(12), 'bold'), **secondary)
         self.help_btn.pack(side='right')
         tk.Label(left_ctrl, text="Find where a street-level photo was taken.", font=(UI_FONT, fs(12)),
-                 bg=BG, fg=MUTED).pack(anchor='w', pady=(0, 14))
+                 bg=BG, fg=MUTED).pack(anchor='w', pady=(0, 12))
+
+        # One-click demo: sample index + sample photo, so a first search works right away
+        demo = tk.Frame(left_ctrl, bg=CARD, highlightbackground=ACCENT_DARK, highlightthickness=1)
+        demo.pack(fill='x', pady=(0, 12))
+        self.demo_frame = demo
+        tk.Label(demo, text="New here? Try a search in one click.", font=(UI_FONT, fs(12), 'bold'),
+                 bg=CARD, fg=TEXT).pack(anchor='w', padx=16, pady=(12, 2))
+        tk.Label(demo, text="Loads a small sample index (central Moscow) and a sample photo. "
+                            "Then just press Run Search.", font=(UI_FONT, fs(11)), bg=CARD, fg=MUTED,
+                 wraplength=INNER_W, justify='left').pack(anchor='w', padx=16)
+        self.demo_btn = RoundedButton(demo, text="Try the demo", command=self.try_demo,
+                                      width=INNER_W, height=36, font=(UI_FONT, fs(12), 'bold'))
+        self.demo_btn.pack(padx=16, pady=(10, 14))
+        self.demo_status = tk.Label(demo, text="", font=(UI_FONT, fs(11)), bg=CARD, fg=MUTED,
+                                    wraplength=INNER_W, justify='left', anchor='w')
 
         # ── Step 1: what to do ──
         card, body, self._badge1 = self._card(left_ctrl, "Choose what to do", step=1)
@@ -2087,6 +2107,12 @@ class StreetViewMatcherGUI:
              "This tour shows you every part of the screen. The part being explained is "
              "outlined in purple. Use Next and Back, or close the tour any time.",
              None),
+            ("Try the demo",
+             "The quickest way to see Netryx work: this loads a small sample index of "
+             "central Moscow and a sample photo taken there. Then press Run Search and "
+             "watch it find the spot.\n\n"
+             "The first time, the sample index (about 180 MB) downloads from the Community Hub.",
+             lambda: self.demo_frame),
             ("Step 1 · Mode",
              "Search a photo: find where your photo was taken, inside an area that "
              "already has an index.\n\n"
@@ -3135,7 +3161,7 @@ class StreetViewMatcherGUI:
 
     def _job_buttons(self):
         return [self.query_btn, self.coverage_btn, self.index_selector_btn,
-                self.export_btn, self.import_btn]
+                self.export_btn, self.import_btn, self.demo_btn]
 
     def _job_running(self):
         """True (and tells the user) if a long job is already running."""
@@ -3156,23 +3182,33 @@ class StreetViewMatcherGUI:
         self._job = None
         for btn in self._job_buttons():
             btn.config(state='normal')
+        if getattr(self, '_demo_pending', False):
+            # on success activate() runs right after this and sets "Demo loaded"
+            self.demo_btn.config(text="Try the demo")
         self.progress['value'] = 0
         self._update_mode()
 
-    def _run_job(self, name, target):
+    def _run_job(self, name, target, on_success=None, on_error=None):
         """Run target in a background thread as the one long job. The buttons
-        come back when it ends, even if it raises."""
+        come back when it ends, even if it raises. on_success(result) or
+        on_error(message) then runs on the main thread, after the job has ended."""
         if not self._begin_job(name):
             return False
         def wrapper():
+            result, failed = None, None
             try:
-                target()
+                result = target()
             except Exception as e:
+                failed = str(e) or type(e).__name__
                 import traceback
                 traceback.print_exc()
                 self.master.after(0, lambda m=str(e): self._set_status(f"{name} failed: {m}"))
             finally:
                 self.master.after(0, self._end_job)
+                if on_success is not None and failed is None:
+                    self.master.after(0, lambda: on_success(result))
+                if on_error is not None and failed is not None:
+                    self.master.after(0, lambda: on_error(failed))
         threading.Thread(target=wrapper, daemon=True).start()
         return True
 
@@ -3258,7 +3294,7 @@ class StreetViewMatcherGUI:
         if getattr(self, '_job', None):
             return
         if searching and not has_index:
-            hint = "Step 1: select an index, or download one from the Community Hub."
+            hint = "Step 1: select an index or download one from the Community Hub, or press Try the demo."
         elif not area_ok:
             hint = "Step 2: enter a valid latitude, longitude and radius."
         elif searching and not photo_ok:
@@ -3294,6 +3330,117 @@ class StreetViewMatcherGUI:
         self.search_nets = []
         self._clear_result_elements()
         self._refresh_steps()
+
+    def _find_demo_index(self):
+        """A local MegaLoc index covering the demo area, if one is installed."""
+        for m in scan_indexes():
+            cov = m.get("coverage_center", {})
+            if cov.get("lat") is None or str(m.get("descriptor_model", "MegaLoc")).lower() == "mixvpr":
+                continue
+            if haversine((cov["lat"], cov["lon"]), DEMO_CENTER) <= 1.0:
+                return m
+        return None
+
+    def try_demo(self):
+        """Activate the sample index (downloading it from the Community Hub
+        the first time) and load the sample photo, ready to Run Search. Every
+        step shows in the demo box, and the photo and Run button are brought
+        into view when it's ready."""
+        if self._job_running():
+            return
+        self._demo_pending = True
+        self.demo_btn.config(text="Loading the demo…")
+        self._demo_status("Getting the sample index ready…")
+
+        def activate(manifest):
+            global _compact_cache
+            self._demo_status("Loading the sample index…")
+            self.master.update_idletasks()
+            loaded = load_index(manifest["index_id"]) or manifest
+            _compact_cache = None
+            self.encoder_var.set(ACTIVE_ENCODER)
+            self.index_selector_var.set(f"Active: {loaded.get('name', 'demo index')}")
+            cov = loaded.get("coverage_center") or {"lat": loaded.get("center_lat"), "lon": loaded.get("center_lon")}
+            if cov.get("lat") is not None:
+                self.lat_var.set(cov["lat"])
+                self.lon_var.set(cov["lon"])
+            if loaded.get("radius_km") is not None:
+                self.radius_var.set(loaded["radius_km"])
+            self.mode_var.set("search")
+            self._update_mode()
+            self.choose_photo(DEMO_PHOTO)
+            if self.query_img_path != DEMO_PHOTO:
+                self._demo_failed("the sample photo could not be loaded")
+                return
+            self._demo_pending = False
+            self.demo_btn.config(text="✓  Demo loaded")
+            self._demo_status("✓ Sample index active    ✓ Sample photo loaded\n"
+                              "Now press Run Search below (it usually takes a minute or two).", ACCENT_LIGHT)
+            self._set_status("Demo ready: press Run Search.")
+            # bring the loaded photo and the Run button into view, and point them out
+            self._scroll_into_view(self._cards[2])
+            self._flash_frame(self.photo_zone)
+            self._flash_button(self.query_btn)
+
+        local = self._find_demo_index()
+        if local:
+            # let the "Loading…" feedback paint before the (blocking) index load
+            self.master.after(60, lambda: activate(local))
+            return
+        if ACTIVE_ENCODER != "megaloc":
+            set_encoder("megaloc")
+
+        def progress(msg):
+            self.master.after(0, lambda m=msg: (self._set_status(m), self._demo_status(m)))
+
+        def download():
+            manifest = NetryxHub().download(DEMO_INDEX_REPO, DATA_DIR, progress_callback=progress)
+            if not manifest or not manifest.get("index_id"):
+                raise RuntimeError("the demo index could not be downloaded")
+            return manifest
+        if self._run_job("Demo download", download, on_success=activate, on_error=self._demo_failed):
+            self.demo_btn.config(text="Downloading the sample index…")
+            self._demo_status("Downloading the sample index (about 180 MB, only the first time)…")
+            self._set_status("Downloading the demo index (about 180 MB, once)...")
+
+    def _demo_status(self, text, color=MUTED):
+        self.demo_status.config(text=text, fg=color)
+        if text:
+            self.demo_status.pack(anchor='w', padx=16, pady=(0, 12), before=self.demo_btn)
+        else:
+            self.demo_status.pack_forget()
+
+    def _demo_failed(self, reason):
+        self._demo_pending = False
+        self.demo_btn.config(text="Try the demo")
+        self._demo_status(f"⚠ The demo couldn't start: {reason}. Please try again.", ACCENT_LIGHT)
+
+    def _scroll_into_view(self, widget):
+        """Scroll the sidebar so widget is near the top of what's visible."""
+        self.master.update_idletasks()
+        y = widget.winfo_rooty() - self.left_ctrl.winfo_rooty()
+        total = max(self.left_ctrl.winfo_height(), 1)
+        self.sidebar_canvas.yview_moveto(max(0.0, (y - 20) / total))
+
+    def _flash_frame(self, frame, times=6):
+        """Blink a frame's border in the accent colour to draw the eye to it."""
+        def tick(n):
+            if not frame.winfo_exists():
+                return
+            on = n % 2 == 1
+            frame.config(highlightbackground=ACCENT_LIGHT if on else CARD_BORDER, highlightthickness=2 if on else 1)
+            if n > 0:
+                frame.after(280, tick, n - 1)
+        tick(times)
+
+    def _flash_button(self, btn, times=6):
+        def tick(n):
+            if not btn.winfo_exists():
+                return
+            btn._draw_button(ACCENT_LIGHT if n % 2 == 1 else None)
+            if n > 0:
+                btn.after(280, tick, n - 1)
+        tick(times)
 
     def _on_drop(self, event):
         paths = self.master.tk.splitlist(event.data)
