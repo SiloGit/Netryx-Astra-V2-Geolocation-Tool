@@ -1340,6 +1340,19 @@ def load_settings():
     except Exception:
         return {}
 
+def set_app_icon(root):
+    """The Dock icon on macOS (otherwise Python's rocket), the title bar /
+    taskbar icon on Windows and Linux. Found next to this file, so it works
+    whatever folder the app is started from."""
+    if getattr(root, "_netryx_icon", None) is not None:
+        return
+    try:
+        root._netryx_icon = tk.PhotoImage(
+            master=root, file=os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png"))
+        root.iconphoto(True, root._netryx_icon)
+    except Exception as e:
+        print(f"[UI] Could not set the app icon: {e}")
+
 def save_settings(settings):
     try:
         with open(SETTINGS_PATH, "w") as f:
@@ -1577,6 +1590,7 @@ class StreetViewMatcherGUI:
     def __init__(self, master):
         self.master = master
         master.title("Netryx Astra v2 | AI Geolocation")
+        set_app_icon(master)
         master.configure(bg=BG)
         self.settings = load_settings()
         master.geometry(self.settings.get("geometry", "1440x920"))
@@ -3960,5 +3974,6 @@ if __name__ == "__main__":
         root = TkinterDnD.Tk()
     except Exception:
         root = tk.Tk()
+    set_app_icon(root)  # straight away, so the Dock never shows Python's rocket
     app = StreetViewMatcherGUI(root)
     root.mainloop()
